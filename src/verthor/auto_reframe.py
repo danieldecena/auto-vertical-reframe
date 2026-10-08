@@ -8,6 +8,7 @@ import math
 import shutil
 import subprocess
 import tempfile
+import urllib.request
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,23 +19,15 @@ import numpy as np
 from scenedetect import AdaptiveDetector, SceneManager, open_video
 from ultralytics import YOLO
 
+# The legacy `mediapipe.solutions` API is absent from the macOS arm64 wheel at
+# every version; only `mediapipe.tasks` ships there.
 try:
-    from mediapipe.python.solutions import face_detection as mp_face_detection
+    import mediapipe as mp
+    from mediapipe.tasks.python import BaseOptions
+    from mediapipe.tasks.python import vision as mp_vision
 except Exception:
-    try:
-        from mediapipe import solutions as mp_solutions
-        mp_face_detection = mp_solutions.face_detection
-    except Exception:
-        mp_face_detection = None
-
-try:
-    from mediapipe.python.solutions import pose as mp_pose
-except Exception:
-    try:
-        from mediapipe import solutions as _mp_solutions_pose
-        mp_pose = _mp_solutions_pose.pose
-    except Exception:
-        mp_pose = None
+    mp = None
+    mp_vision = None
 
 try:
     import torch
@@ -650,6 +643,37 @@ def current_crop_size(
     return crop_w, crop_h
 
 
+# The tasks API takes a model file; the legacy API bundled its own.
+MEDIAPIPE_MODEL_DIR = Path.home() / ".cache" / "verthor"
+MEDIAPIPE_MODEL_URLS = {
+    "blaze_face_short_range.tflite": (
+        "https://storage.googleapis.com/mediapipe-models/face_detector/"
+        "blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
+    ),
+    "pose_landmarker_full.task": (
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+        "pose_landmarker_full/float16/1/pose_landmarker_full.task"
+    ),
+}
+
+
+def mediapipe_model_path(name: str) -> str:
+    path = MEDIAPIPE_MODEL_DIR / name
+    if not path.exists():
+        MEDIAPIPE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        # Download to a temp file and rename, so an interrupted fetch is
+        # never mistaken for a model on the next run.
+        with urllib.request.urlopen(
+            MEDIAPIPE_MODEL_URLS[name], timeout=30
+        ) as response:
+            with tempfile.NamedTemporaryFile(
+                dir=MEDIAPIPE_MODEL_DIR, delete=False
+            ) as partial:
+                shutil.copyfileobj(response, partial)
+        Path(partial.name).replace(path)
+    return str(path)
+
+
 def get_track_id(box: Any) -> Optional[int]:
     try:
         if box.id is None:
@@ -662,7 +686,7 @@ def get_track_id(box: Any) -> Optional[int]:
 class MediaPipeFaceHelper:
     def __init__(self, min_detection_confidence: float = 0.45):
         self.detector = None
-        if mp_face_detection is None:
+        if mp_vision is None:
             logging.warning(
                 "MediaPipe face detection is unavailable in this environment; "
                 "continuing without face-priority framing."
@@ -670,9 +694,15 @@ class MediaPipeFaceHelper:
             return
 
         try:
-            self.detector = mp_face_detection.FaceDetection(
-                model_selection=0,
-                min_detection_confidence=min_detection_confidence,
+            self.detector = mp_vision.FaceDetector.create_from_options(
+                mp_vision.FaceDetectorOptions(
+                    base_options=BaseOptions(
+                        model_asset_path=mediapipe_model_path(
+                            "blaze_face_short_range.tflite"
+                        )
+                    ),
+                    min_detection_confidence=min_detection_confidence,
+                )
             )
         except Exception as exc:
             logging.warning(
@@ -703,23 +733,20 @@ class MediaPipeFaceHelper:
         upper_h = max(1, int((y2 - y1) * 0.65))
         roi = roi[:upper_h, :]
         rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-        result = self.detector.process(rgb)
+        result = self.detector.detect(
+            mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        )
         if not result.detections:
             return None
 
         best = None
         best_area = -1.0
         for det in result.detections:
-            bbox = det.location_data.relative_bounding_box
-            fx1 = max(0.0, bbox.xmin)
-            fy1 = max(0.0, bbox.ymin)
-            fw = max(0.0, bbox.width)
-            fh = max(0.0, bbox.height)
-
-            px1 = int(round(fx1 * roi.shape[1]))
-            py1 = int(round(fy1 * roi.shape[0]))
-            px2 = int(round((fx1 + fw) * roi.shape[1]))
-            py2 = int(round((fy1 + fh) * roi.shape[0]))
+            bbox = det.bounding_box
+            px1 = max(0, bbox.origin_x)
+            py1 = max(0, bbox.origin_y)
+            px2 = px1 + max(0, bbox.width)
+            py2 = py1 + max(0, bbox.height)
 
             area = max(1, px2 - px1) * max(1, py2 - py1)
             if area > best_area:
@@ -759,7 +786,7 @@ class MediaPipePoseHelper:
     def __init__(self, min_detection_confidence: float = 0.35):
         self.detector = None
         self.min_visibility = 0.35
-        if mp_pose is None:
+        if mp_vision is None:
             logging.warning(
                 "MediaPipe pose is unavailable; composition will fall back "
                 "to mask-based framing."
@@ -767,12 +794,19 @@ class MediaPipePoseHelper:
             return
 
         try:
-            self.detector = mp_pose.Pose(
-                static_image_mode=False,
-                model_complexity=1,
-                enable_segmentation=False,
-                min_detection_confidence=min_detection_confidence,
-                min_tracking_confidence=0.4,
+            # Image mode: each call is a different person's crop, so there
+            # is no frame-to-frame track to carry. The legacy tracking
+            # threshold (0.4) gated landmark presence, so it moves there.
+            self.detector = mp_vision.PoseLandmarker.create_from_options(
+                mp_vision.PoseLandmarkerOptions(
+                    base_options=BaseOptions(
+                        model_asset_path=mediapipe_model_path(
+                            "pose_landmarker_full.task"
+                        )
+                    ),
+                    min_pose_detection_confidence=min_detection_confidence,
+                    min_pose_presence_confidence=0.4,
+                )
             )
         except Exception as exc:
             logging.warning(
@@ -807,7 +841,9 @@ class MediaPipePoseHelper:
 
         try:
             rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-            result = self.detector.process(rgb)
+            result = self.detector.detect(
+                mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            )
         except Exception:
             return None
 
@@ -816,13 +852,13 @@ class MediaPipePoseHelper:
 
         roi_h, roi_w = roi.shape[:2]
         points: dict[str, tuple[float, float, float]] = {}
-        for idx, lm in enumerate(result.pose_landmarks.landmark):
+        for idx, lm in enumerate(result.pose_landmarks[0]):
             name = POSE_LANDMARK_NAMES.get(idx)
             if name is None:
                 continue
             px = rx1 + lm.x * roi_w
             py = ry1 + lm.y * roi_h
-            vis = float(getattr(lm, "visibility", 0.0))
+            vis = float(lm.visibility or 0.0)
             points[name] = (px, py, vis)
 
         if not points:
